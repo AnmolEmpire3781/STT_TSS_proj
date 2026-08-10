@@ -1,0 +1,6 @@
+fastapi>=0.116
+uvicorn[standard]>=0.35
+torch
+transformers
+soundfile
+parler-tts @ git+https://github.com/huggingface/parler-tts.git

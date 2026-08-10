@@ -1,0 +1,4 @@
+{"id":"en-001","language":"en","question":"How many paid annual leave days do full-time employees receive?","expected_source":"sample_leave_policy_en.md","expected_fact":"18 days"}
+{"id":"hi-001","language":"hi","question":"रिफंड शुरू होने के बाद बैंक में राशि आने में कितना समय लग सकता है?","expected_source":"sample_refund_policy_hi.txt","expected_fact":"3 से 7 कार्य दिवस"}
+{"id":"cross-001","language":"hi","question":"डेमो डिवाइस की standard warranty कितनी है?","expected_source":"sample_product_faq_bilingual.csv","expected_fact":"दो साल / two-year"}
+{"id":"cross-002","language":"en","question":"How long after approval does the company initiate a refund?","expected_source":"sample_refund_policy_hi.txt","expected_fact":"2 working days"}
