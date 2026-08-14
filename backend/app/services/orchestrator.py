@@ -77,6 +77,7 @@
 #         }
 
 import base64
+import re
 import time
 import uuid
 
@@ -87,6 +88,10 @@ from app.providers.factory import (
     build_tts,
 )
 from app.rag.vector_store import get_vector_store
+
+
+# Splits on sentence-ending punctuation (incl. Hindi danda) followed by whitespace.
+SENTENCE_END_RE = re.compile(r"[.!?।]+\s+")
 
 
 class VoiceRAGOrchestrator:
@@ -411,4 +416,100 @@ class VoiceRAGOrchestrator:
 
             "rag_based":
                 rag_based,
+        }
+
+
+    # ========================================================
+    # STREAMING TEXT PIPELINE
+    #
+    # Retrieves once, then streams LLM tokens. As soon as a full
+    # sentence has arrived it is synthesized to audio immediately,
+    # instead of waiting for the whole answer, cutting perceived
+    # latency. Yields dict events; the last event has type "final".
+    # ========================================================
+
+    async def answer_text_streaming(
+        self,
+        query: str,
+        language: str = "en",
+        top_k: int | None = None,
+        rag_based: bool = True,
+    ):
+        request_id = str(uuid.uuid4())
+        timings = {}
+        total_started = time.perf_counter()
+
+        if rag_based:
+            retrieval_started = time.perf_counter()
+            contexts = get_vector_store().query(
+                query,
+                top_k or self.s.rag_top_k,
+                self.s.rag_min_score,
+            )
+            timings["retrieval"] = (time.perf_counter() - retrieval_started) * 1000
+        else:
+            contexts = []
+            timings["retrieval"] = 0.0
+
+        yield {"type": "contexts", "request_id": request_id, "contexts": contexts}
+
+        llm_started = time.perf_counter()
+        buffer = ""
+        full_answer = ""
+        sentence_index = 0
+
+        async for delta in self.llm.answer_stream(query, contexts, language, rag_based):
+            full_answer += delta
+            buffer += delta
+            yield {"type": "delta", "text": delta}
+
+            while True:
+                match = SENTENCE_END_RE.search(buffer)
+                if not match:
+                    break
+
+                sentence = buffer[: match.end()].strip()
+                buffer = buffer[match.end() :]
+
+                if sentence:
+                    async for event in self._synthesize_sentence(sentence, language, sentence_index):
+                        yield event
+                    sentence_index += 1
+
+        # Flush trailing text that had no closing punctuation.
+        if buffer.strip():
+            async for event in self._synthesize_sentence(buffer.strip(), language, sentence_index):
+                yield event
+            sentence_index += 1
+
+        timings["llm"] = (time.perf_counter() - llm_started) * 1000
+        timings["total"] = (time.perf_counter() - total_started) * 1000
+
+        yield {
+            "type": "final",
+            "request_id": request_id,
+            "answer": full_answer.strip(),
+            "sources": contexts,
+            "timings_ms": {k: round(v, 2) for k, v in timings.items()},
+            "rag_based": rag_based,
+        }
+
+    async def _synthesize_sentence(self, sentence: str, language: str, index: int):
+        try:
+            spoken = await self.tts.synthesize(sentence, language)
+        except Exception:
+            spoken = None
+
+        audio_b64 = None
+        audio_mime = None
+        if spoken is not None and spoken.data:
+            audio_b64 = base64.b64encode(spoken.data).decode("ascii")
+            audio_mime = spoken.mime_type
+
+        yield {
+            "type": "sentence_audio",
+            "index": index,
+            "text": sentence,
+            "audio_base64": audio_b64,
+            "audio_mime": audio_mime,
         }

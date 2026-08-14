@@ -1149,6 +1149,8 @@
 #     save_feedback(req)
 #     return {"ok": True}
 
+import base64
+import time
 from pathlib import Path
 
 from fastapi import (
@@ -1157,6 +1159,8 @@ from fastapi import (
     Form,
     HTTPException,
     UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
 )
 
 from app.core.config import get_settings
@@ -1244,9 +1248,21 @@ def validate_language(
     return lang
 
 
-# ============================================================
-# HEALTH
-# ============================================================
+def filename_for_mime(mime_type: str) -> str:
+    mime = (mime_type or "").lower()
+    if "wav" in mime:
+        return "speech.wav"
+    if "mp4" in mime or "m4a" in mime:
+        return "speech.mp4"
+    if "ogg" in mime:
+        return "speech.ogg"
+    return "speech.webm"
+
+
+MAX_AUDIO_BYTES = 25 * 1024 * 1024
+
+
+
 
 @router.get(
     "/health"
@@ -1530,3 +1546,158 @@ async def feedback(
         "ok":
             True
     }
+
+
+# ============================================================
+# CONTINUOUS VOICE WEBSOCKET (VAD-driven auto turn-taking)
+#
+# Browser sends per utterance:
+#   1. JSON: {"type": "utterance.start", "language", "top_k", "rag_based", "mime_type"}
+#   2. binary frame: the recorded utterance audio
+#
+# Backend streams back stage events, then a final "turn.result".
+# ============================================================
+
+@router.websocket("/ws/voice")
+async def voice_ws(websocket: WebSocket):
+    await websocket.accept()
+    await websocket.send_json({"type": "session.ready"})
+
+    while True:
+        try:
+            metadata = await websocket.receive_json()
+
+            if metadata.get("type") != "utterance.start":
+                await websocket.send_json({
+                    "type": "error",
+                    "message": "Expected an utterance.start metadata message.",
+                })
+                continue
+
+            try:
+                language = validate_language(metadata.get("language", "en"))
+            except HTTPException as exc:
+                await websocket.send_json({"type": "error", "message": str(exc.detail)})
+                continue
+
+            try:
+                top_k = int(metadata.get("top_k", 5))
+            except (TypeError, ValueError):
+                top_k = 5
+            top_k = max(1, min(top_k, 20))
+
+            rag_based = bool(metadata.get("rag_based", True))
+            mime_type = str(metadata.get("mime_type") or "audio/wav")
+
+            audio_bytes = await websocket.receive_bytes()
+
+            if not audio_bytes:
+                await websocket.send_json({"type": "error", "message": "Received empty audio."})
+                continue
+
+            if len(audio_bytes) > MAX_AUDIO_BYTES:
+                await websocket.send_json({
+                    "type": "error",
+                    "message": "Audio exceeds 25 MB starter limit.",
+                })
+                continue
+
+            total_started = time.perf_counter()
+            timings: dict[str, float] = {}
+
+            # -------------------------------------------------
+            # STT
+            # -------------------------------------------------
+            await websocket.send_json({"type": "stt.started"})
+            stage_started = time.perf_counter()
+            transcript = await orch().stt.transcribe(
+                filename_for_mime(mime_type),
+                audio_bytes,
+                mime_type,
+                language,
+            )
+            timings["stt"] = (time.perf_counter() - stage_started) * 1000
+
+            transcript = (transcript or "").strip()
+            if not transcript:
+                await websocket.send_json({
+                    "type": "error",
+                    "message": "No speech was recognized in that utterance.",
+                })
+                continue
+
+            await websocket.send_json({"type": "transcript", "text": transcript})
+
+            # -------------------------------------------------
+            # RAG / Direct LLM, streamed sentence-by-sentence to TTS
+            #
+            # As soon as the LLM finishes a sentence, that sentence is
+            # synthesized and sent to the browser immediately, instead
+            # of waiting for the full answer + full audio (lower
+            # perceived latency, matches how VAPI-style bots feel).
+            # -------------------------------------------------
+            await websocket.send_json({"type": "rag.started"})
+
+            request_id = None
+            answer = ""
+            contexts = []
+            result_timings: dict[str, float] = {}
+            tts_sent = False
+
+            async for event in orch().answer_text_streaming(
+                transcript,
+                language,
+                top_k,
+                rag_based,
+            ):
+                event_type = event["type"]
+
+                if event_type == "delta":
+                    await websocket.send_json({"type": "answer.delta", "text": event["text"]})
+
+                elif event_type == "sentence_audio":
+                    tts_sent = True
+                    await websocket.send_json({
+                        "type": "tts.chunk",
+                        "index": event["index"],
+                        "text": event["text"],
+                        "audio_base64": event["audio_base64"],
+                        "audio_mime": event["audio_mime"],
+                    })
+
+                elif event_type == "final":
+                    request_id = event["request_id"]
+                    answer = event["answer"]
+                    contexts = event["sources"]
+                    result_timings = event["timings_ms"]
+
+            timings.update(result_timings)
+            timings["total"] = (time.perf_counter() - total_started) * 1000
+
+            result = {
+                "request_id": request_id,
+                "transcript": transcript,
+                "answer": answer,
+                "sources": contexts,
+                # Audio was already streamed as "tts.chunk" events above.
+                "audio_base64": None,
+                "audio_mime": None,
+                "browser_tts_fallback": not tts_sent,
+                "timings_ms": {k: round(v, 2) for k, v in timings.items()},
+                "rag_based": rag_based,
+                "streamed": True,
+            }
+
+            await websocket.send_json({"type": "turn.result", "data": result})
+
+        except WebSocketDisconnect:
+            break
+
+        except Exception as exc:
+            try:
+                await websocket.send_json({
+                    "type": "error",
+                    "message": f"Voice turn failed: {exc}",
+                })
+            except Exception:
+                break
