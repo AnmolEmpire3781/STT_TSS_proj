@@ -187,6 +187,8 @@
 #         return answer
 
 
+import json
+
 import httpx
 
 from .base import LLMProvider
@@ -395,13 +397,13 @@ class OpenAICompatibleLLM(LLMProvider):
         self.reasoning_effort = reasoning_effort
 
 
-    async def answer(
+    def _build_prompt(
         self,
         question: str,
         contexts: list[dict],
-        language: str = "en",
-        rag_based: bool = True,
-    ) -> str:
+        language: str,
+        rag_based: bool,
+    ) -> tuple[str, str]:
 
         requested_language = LANGUAGE_LABEL.get(
             language,
@@ -471,6 +473,21 @@ class OpenAICompatibleLLM(LLMProvider):
                 f"{question}"
             )
 
+
+        return system_prompt, user_prompt
+
+
+    async def answer(
+        self,
+        question: str,
+        contexts: list[dict],
+        language: str = "en",
+        rag_based: bool = True,
+    ) -> str:
+
+        system_prompt, user_prompt = self._build_prompt(
+            question, contexts, language, rag_based
+        )
 
         # ====================================================
         # Groq/OpenAI-compatible request
@@ -576,3 +593,76 @@ class OpenAICompatibleLLM(LLMProvider):
 
 
         return answer
+
+
+    # ============================================================
+    # STREAMING
+    #
+    # Yields raw text deltas as they arrive over SSE, so the caller
+    # can start TTS on completed sentences before the full answer
+    # has finished generating (lowers perceived latency).
+    #
+    # NOTE: deltas are NOT passed through clean_assistant_answer();
+    # callers should clean the final assembled text if needed.
+    # ============================================================
+
+    async def answer_stream(
+        self,
+        question: str,
+        contexts: list[dict],
+        language: str = "en",
+        rag_based: bool = True,
+    ):
+
+        system_prompt, user_prompt = self._build_prompt(
+            question, contexts, language, rag_based
+        )
+
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.2,
+            "max_tokens": 400,
+            "stream": True,
+        }
+
+        if self.reasoning_effort:
+            payload["reasoning_effort"] = self.reasoning_effort
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+        async with httpx.AsyncClient(timeout=120) as client:
+            async with client.stream(
+                "POST",
+                f"{self.base_url}/chat/completions",
+                headers=headers,
+                json=payload,
+            ) as response:
+                response.raise_for_status()
+
+                async for line in response.aiter_lines():
+                    if not line or not line.startswith("data:"):
+                        continue
+
+                    data = line[len("data:") :].strip()
+                    if data == "[DONE]":
+                        break
+
+                    try:
+                        obj = json.loads(data)
+                    except ValueError:
+                        continue
+
+                    delta = (
+                        obj.get("choices", [{}])[0]
+                        .get("delta", {})
+                        .get("content")
+                    )
+                    if delta:
+                        yield delta
