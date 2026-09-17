@@ -6,17 +6,28 @@ This project is an English/Hindi voice RAG application.
 
 Stable voice workflow:
 
-Record
--> Stop
--> Ask with voice
--> STT
--> RAG or Direct LLM
--> TTS
--> response
+Current primary voice workflow
 
-Do not replace this with WebSocket, VAD, continuous listening,
-always-on microphone, or automatic silence submission unless the
-user explicitly requests it.
+Start conversation
+↓
+browser microphone
+↓
+VAD
+↓
+automatic utterance/end detection
+↓
+WebSocket
+↓
+STT
+↓
+RAG or Direct LLM
+↓
+streaming/generation
+↓
+TTS
+↓
+response
+It has with WebSocket, VAD implemented in it.
 
 ## Supported answer modes
 
@@ -77,7 +88,7 @@ TTS:
 Edge TTS
 
 Do not replace providers, models, ports, API URLs, document paths,
-or environment settings unless explicitly requested.
+or environment settings unless explicitly requested with approval.
 
 ## Languages
 
@@ -87,7 +98,7 @@ Supported response languages:
 - Hindi
 
 Hinglish and mixed Hindi-English queries should be understood
-naturally.
+naturally with accuracy.
 
 Do not translate technical names unnecessarily.
 
@@ -138,14 +149,14 @@ When implementing:
 
 - make minimal focused changes
 - do not rewrite unrelated files
-- keep useful comments
+- keep useful comments with prefix #codec*change*+Timestamp+DATE
 - add comments around non-obvious architectural decisions
 - preserve existing naming and style where practical
 
 For requests to explain/review:
 
 - inspect and report
-- do not modify files unless explicitly asked
+- do not modify files unless explicitly asked and approved
 
 For requests to implement/fix:
 
@@ -184,3 +195,21 @@ At completion report:
 - behavior changed
 - validation performed
 - anything not tested
+
+## Architecture synchronization
+
+The code on the current main branch is the implementation source of truth.
+
+If AGENTS.md conflicts with code introduced by an already-reviewed and
+merged change:
+
+1. Do not silently revert the implementation to match stale instructions.
+2. Report the conflict.
+3. Determine whether the merged implementation represents an intentional
+   architecture change.
+4. If confirmed, update AGENTS.md to describe the new architecture.
+5. Preserve the old behavior only when it remains an intentional fallback.
+
+When a feature changes a documented architecture, API contract, provider,
+workflow, or important invariant, update AGENTS.md in the same feature
+branch or immediately after the merge.
