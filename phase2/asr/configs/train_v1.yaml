@@ -1,8 +1,8 @@
 schema_version: 1
 model: openai/whisper-large-v3-turbo
 model_revision: main
-#codec*change*+2026-09-17 The selected Hinglish mode is an experiment input,
-# never a hard-coded Hindi prefix. Replace this after the three-mode baseline.
+#codec*change*+2026-09-28 Decoding selection is recorded by compare_models.py;
+# keep this training prefix explicit and pass the selected artifact to evaluation.
 hinglish_language_mode: auto
 seed: 17
 max_steps: -1
@@ -12,6 +12,7 @@ gradient_accumulation_steps: 16
 learning_rate: 0.0001
 warmup_ratio: 0.05
 save_steps: 100
+checkpoint_keep: 2
 logging_steps: 5
 lora_r: 16
 lora_alpha: 32

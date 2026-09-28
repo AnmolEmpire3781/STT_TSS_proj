@@ -420,6 +420,7 @@ def _configuration(
     requested_dtype: str,
     seed: int,
     warmup_samples: int,
+    part_size: int,
     keyword_metadata: Mapping[str, Any],
 ) -> dict[str, Any]:
     return {
@@ -432,6 +433,7 @@ def _configuration(
         "requested_dtype": requested_dtype,
         "seed": seed,
         "warmup_samples": warmup_samples,
+        "part_size": part_size,
         "latency_scope": "audio_load_resample_feature_extraction_and_generation",
     }
 
@@ -458,12 +460,31 @@ def run_evaluation(args: argparse.Namespace) -> dict[str, Any]:
         processor_id=args.processor_id,
         local_files_only=args.local_files_only,
     )
-    decoding = DecodingConfig(
-        hinglish_mode=args.hinglish_mode,
-        num_beams=args.num_beams,
-        max_new_tokens=args.max_new_tokens,
-        chunk_length_seconds=args.chunk_length_seconds,
-    )
+    if args.decoding_config:
+        decoding_config_path = Path(args.decoding_config).resolve()
+        if not is_complete(decoding_config_path.parent, verify=True):
+            raise EvaluationError(
+                "--decoding-config must belong to a complete checksummed artifact"
+            )
+        decoding_document = _read_json(decoding_config_path)
+        if not isinstance(decoding_document, Mapping):
+            raise EvaluationError("--decoding-config must contain a JSON object")
+        decoding_value = decoding_document.get("decoding")
+        if not isinstance(decoding_value, Mapping):
+            raise EvaluationError("--decoding-config must contain a decoding object")
+        decoding = DecodingConfig(
+            hinglish_mode=str(decoding_value["hinglish_mode"]),
+            num_beams=int(decoding_value["num_beams"]),
+            max_new_tokens=int(decoding_value["max_new_tokens"]),
+            chunk_length_seconds=float(decoding_value["chunk_length_seconds"]),
+        )
+    else:
+        decoding = DecodingConfig(
+            hinglish_mode=args.hinglish_mode,
+            num_beams=args.num_beams,
+            max_new_tokens=args.max_new_tokens,
+            chunk_length_seconds=args.chunk_length_seconds,
+        )
     configuration = _configuration(
         suite,
         model_spec,
@@ -472,6 +493,7 @@ def run_evaluation(args: argparse.Namespace) -> dict[str, Any]:
         requested_dtype=args.dtype,
         seed=args.seed,
         warmup_samples=args.warmup_samples,
+        part_size=args.part_size,
         keyword_metadata=keyword_metadata,
     )
     configuration_fingerprint = sha256_json(configuration)
@@ -721,6 +743,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--processor-id")
     parser.add_argument("--adapter-path", help="Local path or Hub ID for a PEFT adapter")
     parser.add_argument("--adapter-revision")
+    parser.add_argument(
+        "--decoding-config",
+        help="selected-decoding.json produced by compare_models.py",
+    )
     parser.add_argument(
         "--hinglish-mode",
         choices=HINGLISH_MODES,

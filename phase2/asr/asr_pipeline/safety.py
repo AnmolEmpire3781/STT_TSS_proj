@@ -213,15 +213,19 @@ def seal_artifact(artifact_dir: str | os.PathLike[str]) -> ArtifactVerification:
     return verify_complete_artifact(root)
 
 
-def _has_git_marker(path: Path, stop: Path) -> bool:
+def _contains_git_marker(path: Path) -> bool:
+    return (path / ".git").exists() or any(
+        candidate.exists() for candidate in path.rglob(".git")
+    )
+
+
+def _has_nested_mount_ancestor(path: Path) -> bool:
     current = path
-    while True:
-        if (current / ".git").exists():
+    while current.parent != current:
+        if os.path.ismount(current):
             return True
-        if current == stop or current.parent == current:
-            break
         current = current.parent
-    return any(candidate.exists() for candidate in path.rglob(".git"))
+    return False
 
 
 def _validate_root_shape(root: Path, label: str) -> None:
@@ -239,6 +243,7 @@ def validate_cleanup_target(
     *,
     work_root: str | os.PathLike[str],
     persistent_root: str | os.PathLike[str],
+    repository_roots: Iterable[str | os.PathLike[str]] = (),
 ) -> Path:
     """Resolve and validate one disposable staging directory for deletion."""
 
@@ -262,7 +267,19 @@ def validate_cleanup_target(
         raise SafetyError(f"Cleanup target overlaps persistent storage: {resolved_target}")
     if os.path.ismount(resolved_target):
         raise SafetyError(f"Cleanup target cannot be a mount point: {resolved_target}")
-    if _has_git_marker(resolved_target, resolved_work_root):
+    if _has_nested_mount_ancestor(resolved_target):
+        raise SafetyError(
+            f"Cleanup target cannot be inside a nested mount: {resolved_target}"
+        )
+    for repository_root in repository_roots:
+        resolved_repository = _resolved(repository_root, strict=False)
+        if _is_relative_to(resolved_target, resolved_repository) or _is_relative_to(
+            resolved_repository, resolved_target
+        ):
+            raise SafetyError(
+                f"Cleanup target overlaps a repository: {resolved_target}"
+            )
+    if _contains_git_marker(resolved_target):
         raise SafetyError(f"Cleanup target is or contains the active repository boundary: {resolved_target}")
     return resolved_target
 

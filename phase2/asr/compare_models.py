@@ -358,6 +358,93 @@ def write_comparison(
     return json_path, markdown_path
 
 
+def _decoding_without_hinglish(run: Mapping[str, Any]) -> dict[str, Any]:
+    decoding = dict(run.get("decoding", {}))
+    prefixes = dict(decoding.get("language_prefix_by_canonical_language", {}))
+    prefixes["hi-en"] = "<selected>"
+    decoding["language_prefix_by_canonical_language"] = prefixes
+    decoding.pop("hinglish_mode", None)
+    return decoding
+
+
+def select_hinglish_decoding(
+    evaluations: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Select the lowest Hinglish WER across compatible auto/hi/en baselines."""
+
+    if len(evaluations) != 3:
+        raise ComparisonError("exactly three baseline evaluations are required")
+    first = evaluations[0]
+    first_run = first["run"]
+    expected = {
+        "suite": _required_fingerprint(first, "suite_fingerprint", "suite"),
+        "normalization": _required_fingerprint(first, "normalization_fingerprint"),
+        "model": _required_fingerprint(first, "model_fingerprint"),
+        "keywords": first_run.get("keyword_catalog", {}).get("sha256"),
+        "hardware": _hardware_signature(first_run),
+        "decoding": _decoding_without_hinglish(first_run),
+        "prediction_ids": first["prediction_ids"],
+    }
+    by_mode: dict[str, dict[str, Any]] = {}
+    for evaluation in evaluations:
+        run = evaluation["run"]
+        if _required_fingerprint(evaluation, "suite_fingerprint", "suite") != expected["suite"]:
+            raise ComparisonError("Hinglish baselines use different suites")
+        if _required_fingerprint(evaluation, "normalization_fingerprint") != expected["normalization"]:
+            raise ComparisonError("Hinglish baselines use different normalization")
+        if _required_fingerprint(evaluation, "model_fingerprint") != expected["model"]:
+            raise ComparisonError("Hinglish baselines use different models")
+        if run.get("keyword_catalog", {}).get("sha256") != expected["keywords"]:
+            raise ComparisonError("Hinglish baselines use different keyword catalogs")
+        if _hardware_signature(run) != expected["hardware"]:
+            raise ComparisonError("Hinglish baselines use different hardware/settings")
+        if _decoding_without_hinglish(run) != expected["decoding"]:
+            raise ComparisonError("Hinglish baselines differ beyond language-prefix mode")
+        if evaluation["prediction_ids"] != expected["prediction_ids"]:
+            raise ComparisonError("Hinglish baselines use different prediction rows")
+        decoding = run.get("decoding", {})
+        mode = decoding.get("hinglish_mode")
+        if mode not in {"auto", "hi", "en"} or mode in by_mode:
+            raise ComparisonError("baselines must contain auto, hi, and en exactly once")
+        metric = evaluation["metrics"].get("by_language", {}).get("hi-en", {})
+        wer = metric.get("wer")
+        if wer is None:
+            raise ComparisonError(f"baseline {mode} has no hi-en WER")
+        by_mode[str(mode)] = {
+            "wer": float(wer),
+            "evaluation": str(evaluation["root"]),
+            "decoding_fingerprint": run.get("decoding_fingerprint"),
+            "decoding": decoding,
+        }
+    if set(by_mode) != {"auto", "hi", "en"}:
+        raise ComparisonError("baselines must contain auto, hi, and en exactly once")
+    tie_order = {"auto": 0, "hi": 1, "en": 2}
+    selected_mode = min(by_mode, key=lambda mode: (by_mode[mode]["wer"], tie_order[mode]))
+    return {
+        "schema_version": "asr-selected-decoding-v1",
+        "created_at": _utc_now(),
+        "selection_metric": "hi-en.wer",
+        "tie_break_order": ["auto", "hi", "en"],
+        "selected_mode": selected_mode,
+        "decoding": by_mode[selected_mode]["decoding"],
+        "decoding_fingerprint": by_mode[selected_mode]["decoding_fingerprint"],
+        "suite_fingerprint": expected["suite"],
+        "normalization_fingerprint": expected["normalization"],
+        "model_fingerprint": expected["model"],
+        "results": by_mode,
+    }
+
+
+def write_selected_decoding(selection: Mapping[str, Any], output_dir: str | Path) -> Path:
+    root = Path(output_dir).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    if any(root.iterdir()):
+        raise ComparisonError("selection output directory must be empty")
+    path = atomic_write_json(root / "selected-decoding.json", selection)
+    mark_complete(root)
+    return path
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -365,9 +452,16 @@ def build_parser() -> argparse.ArgumentParser:
             "fingerprints must match."
         )
     )
-    parser.add_argument("--base", required=True, help="Base evaluation directory")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--base", help="Base evaluation directory")
+    mode.add_argument(
+        "--select-hinglish-from",
+        nargs=3,
+        metavar=("AUTO_DIR", "HI_DIR", "EN_DIR"),
+        help="Select and record the best compatible baseline Hinglish mode",
+    )
     parser.add_argument(
-        "--candidate", required=True, help="Fine-tuned/candidate evaluation directory"
+        "--candidate", help="Fine-tuned/candidate evaluation directory"
     )
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--base-label", default="base")
@@ -379,24 +473,37 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        base = load_evaluation(args.base)
-        candidate = load_evaluation(args.candidate)
-        comparison = compare_evaluations(
-            base,
-            candidate,
-            base_label=args.base_label,
-            candidate_label=args.candidate_label,
-        )
-        json_path, markdown_path = write_comparison(comparison, args.output_dir)
+        if args.select_hinglish_from:
+            evaluations = [load_evaluation(path) for path in args.select_hinglish_from]
+            selection = select_hinglish_decoding(evaluations)
+            selection_path = write_selected_decoding(selection, args.output_dir)
+            output = {
+                "selected_decoding": str(selection_path),
+                "selected_mode": selection["selected_mode"],
+                "decoding_fingerprint": selection["decoding_fingerprint"],
+            }
+        else:
+            if not args.candidate:
+                parser.error("--candidate is required with --base")
+            base = load_evaluation(args.base)
+            candidate = load_evaluation(args.candidate)
+            comparison = compare_evaluations(
+                base,
+                candidate,
+                base_label=args.base_label,
+                candidate_label=args.candidate_label,
+            )
+            json_path, markdown_path = write_comparison(comparison, args.output_dir)
+            output = {
+                "comparison_json": str(json_path),
+                "comparison_markdown": str(markdown_path),
+                "comparison_fingerprint": comparison["comparison_fingerprint"],
+            }
     except (ComparisonError, ArtifactError, KeyError, TypeError, ValueError) as exc:
         parser.error(str(exc))
     print(
         json.dumps(
-            {
-                "comparison_json": str(json_path),
-                "comparison_markdown": str(markdown_path),
-                "comparison_fingerprint": comparison["comparison_fingerprint"],
-            },
+            output,
             sort_keys=True,
         )
     )

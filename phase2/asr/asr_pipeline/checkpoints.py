@@ -310,6 +310,39 @@ def discover_latest_checkpoint(
     return None
 
 
+def prune_checkpoints(
+    persistent_root: str | os.PathLike[str],
+    *,
+    expected_fingerprint: Any,
+    keep: int,
+) -> tuple[Path, ...]:
+    """Remove only verified, compatible checkpoints older than the retention limit."""
+
+    if isinstance(keep, bool) or not isinstance(keep, int) or keep < 1:
+        raise CheckpointError("checkpoint retention must be a positive integer")
+    root = Path(persistent_root).expanduser().resolve(strict=True)
+    if not root.is_dir() or root.is_symlink():
+        raise CheckpointError(f"Persistent checkpoint root must be a directory: {root}")
+    compatible: list[CheckpointInfo] = []
+    for candidate in root.iterdir():
+        if not candidate.is_dir() or candidate.is_symlink():
+            continue
+        if _CHECKPOINT_NAME.fullmatch(candidate.name) is None:
+            continue
+        try:
+            compatible.append(verify_checkpoint(candidate, expected_fingerprint))
+        except IncompatibleCheckpointError:
+            continue
+    compatible.sort(key=lambda info: info.step, reverse=True)
+    removed: list[Path] = []
+    for info in compatible[keep:]:
+        if info.path.parent != root or _CHECKPOINT_NAME.fullmatch(info.path.name) is None:
+            raise CheckpointError(f"Unsafe checkpoint retention target: {info.path}")
+        shutil.rmtree(info.path)
+        removed.append(info.path)
+    return tuple(removed)
+
+
 def restore_checkpoint(
     checkpoint_or_root: str | os.PathLike[str],
     destination_root: str | os.PathLike[str],

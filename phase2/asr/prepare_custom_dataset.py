@@ -44,7 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="0.8,0.1,0.1",
         help="train,validation,test speaker-level duration targets",
     )
-    parser.add_argument("--shard-size-mb", type=int, default=512)
+    parser.add_argument("--shard-size-mb", type=int, default=128)
     parser.add_argument("--ffmpeg-bin", default="ffmpeg")
     return parser
 
@@ -78,6 +78,12 @@ def _parse_ratios(value: str) -> dict[str, float]:
         raise argparse.ArgumentTypeError("split ratios must contain three non-negative values")
     total = sum(values)
     return {name: item / total for name, item in zip(SPLITS, values)}
+
+
+def _safe_component(value: str, label: str) -> str:
+    if not value or Path(value).name != value or value in {".", ".."}:
+        raise SystemExit(f"{label} must be one safe path component")
+    return value
 
 
 def _sha256(path: Path) -> str:
@@ -228,6 +234,7 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit("--release-id is required when --output-dir is omitted")
         release_id = args.release_id
         output_dir = (args.drive_root / "datasets" / "custom" / release_id).resolve()
+    _safe_component(release_id, "--release-id")
     incomplete = output_dir.with_name(f"{output_dir.name}.incomplete")
     if output_dir.exists() or incomplete.exists():
         raise SystemExit(f"Refusing to overwrite an existing release: {output_dir}")

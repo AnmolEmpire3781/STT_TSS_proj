@@ -20,6 +20,7 @@ from asr_pipeline.safety import (
 #codec*change*+2026-09-17 Defaults belong to this Colab CLI; reusable safety logic takes injected roots.
 DEFAULT_WORK_ROOT = Path("/content/voice-rag-asr")
 DEFAULT_DRIVE_ROOT = Path("/content/drive/MyDrive/voice-rag-phase2/stt")
+DEFAULT_REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 
 @dataclass(frozen=True)
@@ -38,11 +39,15 @@ def cleanup_staging(
     persistent_root: str | os.PathLike[str],
     required_artifacts: Sequence[str | os.PathLike[str]],
     execute: bool = False,
+    repository_roots: Sequence[str | os.PathLike[str]] = (DEFAULT_REPOSITORY_ROOT,),
 ) -> CleanupResult:
     """Verify persistence and optionally remove one guarded staging directory."""
 
     safe_target = validate_cleanup_target(
-        target, work_root=work_root, persistent_root=persistent_root
+        target,
+        work_root=work_root,
+        persistent_root=persistent_root,
+        repository_roots=repository_roots,
     )
     verified = validate_persistent_artifacts(
         required_artifacts, persistent_root=persistent_root
@@ -50,7 +55,10 @@ def cleanup_staging(
     if execute:
         #codec*change*+2026-09-17 Revalidate immediately before deletion to narrow path-swap risk.
         second_resolution = validate_cleanup_target(
-            safe_target, work_root=work_root, persistent_root=persistent_root
+            safe_target,
+            work_root=work_root,
+            persistent_root=persistent_root,
+            repository_roots=repository_roots,
         )
         if second_resolution != safe_target:
             raise SafetyError(f"Cleanup target changed during validation: {safe_target}")

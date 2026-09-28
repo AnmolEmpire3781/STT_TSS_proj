@@ -125,7 +125,9 @@ def test_cleanup_refuses_root_outside_repository_and_persistent_paths(
     (target / ".git").mkdir()
     with pytest.raises(SafetyError, match="repository"):
         validate_cleanup_target(
-            target, work_root=work_root, persistent_root=drive_root
+            target,
+            work_root=work_root,
+            persistent_root=drive_root,
         )
 
 
@@ -170,3 +172,20 @@ def test_cli_reports_dry_run_and_requires_execute(tmp_path: Path, capsys: pytest
     assert exit_code == 0
     assert "DRY RUN" in capsys.readouterr().out
     assert target.exists()
+
+
+def test_cleanup_detects_repository_above_nested_work_root(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    (repository / ".git").mkdir(parents=True)
+    work_root = repository / "nested" / "work"
+    target = _staging_run(work_root)
+    drive_root = tmp_path / "drive"
+    drive_root.mkdir()
+
+    with pytest.raises(SafetyError, match="repository"):
+        validate_cleanup_target(
+            target,
+            work_root=work_root,
+            persistent_root=drive_root,
+            repository_roots=[repository],
+        )

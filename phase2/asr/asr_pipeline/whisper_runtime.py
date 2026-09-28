@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .artifacts import sha256_file, sha256_json
+from .revisions import is_immutable_revision
 
 
 BASE_MODEL_ID = "openai/whisper-large-v3-turbo"
@@ -56,6 +57,13 @@ class ModelSpec:
             raise ValueError("model_revision must be non-empty")
         if self.adapter_revision and not self.adapter_path:
             raise ValueError("adapter_revision requires adapter_path")
+        if self.adapter_path and not Path(self.adapter_path).exists():
+            if not self.adapter_revision or not is_immutable_revision(
+                self.adapter_revision
+            ):
+                raise ValueError(
+                    "remote adapters require --adapter-revision as a full commit SHA"
+                )
 
     @cached_property
     def _adapter_content_fingerprint(self) -> str | None:

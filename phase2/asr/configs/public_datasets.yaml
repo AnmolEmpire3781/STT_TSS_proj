@@ -7,7 +7,7 @@ streaming_required: true
 
 snapshot_defaults:
   seed: 20260917
-  shuffle_buffer_size: 1000
+  shuffle_buffer_size: 128
   audio:
     format: wav
     sample_rate: 16000

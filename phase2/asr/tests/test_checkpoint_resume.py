@@ -10,6 +10,7 @@ from asr_pipeline.checkpoints import (
     CheckpointError,
     discover_latest_checkpoint,
     restore_checkpoint,
+    prune_checkpoints,
     sync_checkpoint,
     verify_checkpoint,
 )
@@ -135,3 +136,27 @@ def test_checkpoint_name_and_source_symlinks_are_rejected(tmp_path: Path) -> Non
         pytest.skip("Symlink creation is unavailable on this platform")
     with pytest.raises(CheckpointError, match="symlink"):
         sync_checkpoint(local, tmp_path / "other-persistent", _fingerprint())
+
+
+def test_prune_removes_only_old_compatible_checkpoints(tmp_path: Path) -> None:
+    persistent = tmp_path / "persistent"
+    for step in (1, 2, 3):
+        sync_checkpoint(
+            _local_checkpoint(tmp_path / f"local-{step}", step, str(step)),
+            persistent,
+            _fingerprint(),
+        )
+    sync_checkpoint(
+        _local_checkpoint(tmp_path / "other", 4, "other"),
+        persistent,
+        _fingerprint("other"),
+    )
+
+    removed = prune_checkpoints(
+        persistent, expected_fingerprint=_fingerprint(), keep=2
+    )
+
+    assert [path.name for path in removed] == ["checkpoint-1"]
+    assert (persistent / "checkpoint-2").is_dir()
+    assert (persistent / "checkpoint-3").is_dir()
+    assert (persistent / "checkpoint-4").is_dir()

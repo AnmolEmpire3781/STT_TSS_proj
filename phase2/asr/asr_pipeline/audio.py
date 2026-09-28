@@ -212,6 +212,23 @@ def _array_as_float32_bytes(array: Any) -> tuple[bytes, int]:
     return values.tobytes(order="C"), channels
 
 
+def _torchcodec_samples(audio_value: Any) -> tuple[Any, int] | None:
+    """Read a Datasets 4.x TorchCodec decoder without importing TorchCodec."""
+
+    get_all_samples = getattr(audio_value, "get_all_samples", None)
+    if not callable(get_all_samples):
+        return None
+    try:
+        samples = get_all_samples()
+        sample_rate = int(samples.sample_rate)
+        data = samples.data
+    except Exception as exc:
+        raise AudioError(f"cannot decode TorchCodec audio payload: {exc}") from exc
+    if sample_rate <= 0:
+        raise AudioError("TorchCodec audio payload has an invalid sample rate")
+    return data, sample_rate
+
+
 def convert_audio_payload_to_wav(
     audio_value: Any,
     destination: str | os.PathLike[str],
@@ -225,8 +242,39 @@ def convert_audio_payload_to_wav(
         return convert_audio_to_wav(
             audio_value, destination, ffmpeg_bin=ffmpeg_bin, overwrite=overwrite
         )
+    torchcodec_value = _torchcodec_samples(audio_value)
+    if torchcodec_value is not None:
+        destination_path = Path(destination)
+        if destination_path.exists() and not overwrite:
+            raise FileExistsError(f"destination already exists: {destination_path}")
+        temporary_output = _temporary_wav_path(destination_path)
+        try:
+            array, sample_rate = torchcodec_value
+            stdin_data, channels = _array_as_float32_bytes(array)
+            _run_ffmpeg(
+                [
+                    "-f",
+                    "f32le",
+                    "-ar",
+                    str(sample_rate),
+                    "-ac",
+                    str(channels),
+                    "-i",
+                    "pipe:0",
+                ],
+                temporary_output,
+                ffmpeg_bin=ffmpeg_bin,
+                stdin_data=stdin_data,
+            )
+            return _finish_conversion(
+                temporary_output, destination_path, overwrite=overwrite
+            )
+        finally:
+            temporary_output.unlink(missing_ok=True)
     if not isinstance(audio_value, Mapping):
-        raise AudioError("unsupported audio payload; expected path or mapping")
+        raise AudioError(
+            "unsupported audio payload; expected path, mapping, or TorchCodec decoder"
+        )
 
     payload_path = audio_value.get("path")
     if payload_path and Path(payload_path).is_file():
@@ -342,6 +390,25 @@ def duration_from_audio_payload(audio_value: Any) -> float:
 
     if isinstance(audio_value, (str, os.PathLike)):
         return probe_audio_duration(audio_value)
+    metadata = getattr(audio_value, "metadata", None)
+    for attribute in ("duration_seconds", "duration"):
+        value = getattr(metadata, attribute, None)
+        if value is not None:
+            try:
+                duration = float(value)
+            except (TypeError, ValueError):
+                continue
+            if duration > 0:
+                return duration
+    torchcodec_value = _torchcodec_samples(audio_value)
+    if torchcodec_value is not None:
+        array, sample_rate = torchcodec_value
+        shape = getattr(array, "shape", None)
+        if shape is None or len(shape) not in (1, 2):
+            raise AudioError("TorchCodec audio samples have an unsupported shape")
+        samples = int(shape[-1])
+        if samples > 0:
+            return samples / sample_rate
     if not isinstance(audio_value, Mapping):
         raise AudioError("cannot infer duration from unsupported audio payload")
     array = audio_value.get("array")

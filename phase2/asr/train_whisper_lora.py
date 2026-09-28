@@ -15,13 +15,23 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from asr_pipeline.archives import stage_archived_audio
-from asr_pipeline.artifacts import mark_complete
-from asr_pipeline.checkpoints import restore_checkpoint, sync_checkpoint
+from asr_pipeline.artifacts import mark_complete, require_complete
+from asr_pipeline.checkpoints import (
+    prune_checkpoints,
+    restore_checkpoint,
+    sync_checkpoint,
+    verify_checkpoint,
+)
 
 
 DEFAULT_DRIVE_ROOT = Path("/content/drive/MyDrive/voice-rag-phase2/stt")
 DEFAULT_WORK_ROOT = Path("/content/voice-rag-asr")
 DEFAULT_MODEL = "openai/whisper-large-v3-turbo"
+PROTECTED_SOURCE_SPLITS = {
+    "indicvoices_hi": {"train": "train", "valid": "validation"},
+    "mucs_hinglish": {"train": "train", "test": "test"},
+    "svarah": {"test": "test"},
+}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -46,6 +56,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup-ratio", type=float)
     parser.add_argument("--save-steps", type=int)
     parser.add_argument("--logging-steps", type=int)
+    parser.add_argument("--checkpoint-keep", type=int)
     parser.add_argument("--seed", type=int)
     parser.add_argument("--lora-r", type=int)
     parser.add_argument("--lora-alpha", type=int)
@@ -58,6 +69,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--precision", choices=("auto", "fp16", "bf16"), default="auto")
     parser.add_argument("--load-in-8bit", action="store_true")
+    parser.add_argument(
+        "--allow-incomplete-manifests",
+        action="store_true",
+        help="Development only: permit manifests without COMPLETE/checksums",
+    )
     parser.add_argument(
         "--resume-from-checkpoint",
         default="auto",
@@ -90,8 +106,39 @@ def _manifest_path(value: Path) -> Path:
     return value / "manifest.jsonl" if value.is_dir() else value
 
 
-def _load_manifest(path: Path, allowed_splits: set[str]) -> list[dict[str, Any]]:
+def _safe_component(value: str, label: str) -> str:
+    if not value or Path(value).name != value or value in {".", ".."}:
+        raise SystemExit(f"{label} must be one safe path component")
+    return value
+
+
+def _artifact_type(manifest: Path) -> str | None:
+    for name in ("dataset.json", "snapshot.json", "suite.json"):
+        metadata_path = manifest.parent / name
+        if metadata_path.is_file():
+            value = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if isinstance(value, dict):
+                return str(value.get("artifact_type") or value.get("suite_type") or "")
+    return None
+
+
+def _load_manifest(
+    path: Path,
+    allowed_splits: set[str],
+    *,
+    allow_incomplete: bool = False,
+) -> list[dict[str, Any]]:
     manifest = _manifest_path(path)
+    if not allow_incomplete:
+        require_complete(manifest.parent, verify=True)
+    artifact_type = _artifact_type(manifest)
+    if not allow_incomplete and artifact_type not in {
+        "custom_asr_dataset",
+        "public_training_snapshot",
+    }:
+        raise ValueError(
+            f"{manifest}: unsupported or missing training artifact metadata"
+        )
     rows: list[dict[str, Any]] = []
     with manifest.open(encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, 1):
@@ -105,14 +152,72 @@ def _load_manifest(path: Path, allowed_splits: set[str]) -> list[dict[str, Any]]
                 raise ValueError(f"{manifest}:{line_number}: missing {sorted(missing)}")
             if row["language"] not in {"en", "hi", "hi-en"}:
                 raise ValueError(f"{manifest}:{line_number}: invalid language")
-            if row["split"] not in allowed_splits:
+            if row["split"] not in {"train", "validation", "test"}:
                 raise ValueError(
-                    f"{manifest}:{line_number}: split {row['split']!r} is not allowed here"
+                    f"{manifest}:{line_number}: invalid split {row['split']!r}"
                 )
+            protected = PROTECTED_SOURCE_SPLITS.get(str(row["source"]))
+            if protected is not None:
+                source_split = row.get("source_split")
+                expected_split = protected.get(str(source_split))
+                if expected_split != row["split"]:
+                    raise ValueError(
+                        f"{manifest}:{line_number}: protected source split provenance "
+                        "does not match the canonical split"
+                    )
+            if artifact_type == "custom_asr_dataset" and row.get(
+                "human_verified"
+            ) is not True:
+                raise ValueError(
+                    f"{manifest}:{line_number}: custom transcript is not human verified"
+                )
+            if row["split"] not in allowed_splits:
+                continue
+            row["_artifact_type"] = artifact_type
             rows.append(row)
     if not rows:
         raise ValueError(f"No usable rows in {manifest}")
     return rows
+
+
+def _assert_train_eval_isolation(
+    train_rows: list[dict[str, Any]], eval_rows: list[dict[str, Any]]
+) -> None:
+    train_ids = {str(row["id"]) for row in train_rows}
+    eval_ids = {str(row["id"]) for row in eval_rows}
+    duplicate_ids = train_ids & eval_ids
+    if duplicate_ids:
+        raise ValueError(f"train/eval ID overlap: {sorted(duplicate_ids)[:5]}")
+
+    train_sources = {
+        (str(row["source"]), str(row.get("source_example_id", row["id"])))
+        for row in train_rows
+    }
+    eval_sources = {
+        (str(row["source"]), str(row.get("source_example_id", row["id"])))
+        for row in eval_rows
+    }
+    if train_sources & eval_sources:
+        raise ValueError("train/eval source-example overlap")
+
+    train_audio = {str(row["audio_sha256"]) for row in train_rows if row.get("audio_sha256")}
+    eval_audio = {str(row["audio_sha256"]) for row in eval_rows if row.get("audio_sha256")}
+    if train_audio & eval_audio:
+        raise ValueError("train/eval audio overlap")
+
+    custom_train_speakers = {
+        str(row["speaker_id"])
+        for row in train_rows
+        if row.get("_artifact_type") == "custom_asr_dataset"
+    }
+    custom_eval_speakers = {
+        str(row["speaker_id"])
+        for row in eval_rows
+        if row.get("_artifact_type") == "custom_asr_dataset"
+    }
+    overlap = custom_train_speakers & custom_eval_speakers
+    if overlap:
+        raise ValueError(f"custom speaker leakage across train/eval: {sorted(overlap)[:5]}")
 
 
 def _sha256_file(path: Path) -> str:
@@ -204,6 +309,7 @@ class ManifestDataset:
 class WhisperCollator:
     processor: Any
     hinglish_language_mode: str
+    decoder_start_token_id: int
 
     def _prefix_language(self, language: str) -> str | None:
         if language == "en":
@@ -243,8 +349,9 @@ class WhisperCollator:
         labels = labels_batch["input_ids"].masked_fill(
             labels_batch.attention_mask.ne(1), -100
         )
-        decoder_start = self.processor.tokenizer.pad_token_id
-        if labels.shape[1] and torch.all(labels[:, 0] == decoder_start):
+        if labels.shape[1] and torch.all(
+            labels[:, 0] == self.decoder_start_token_id
+        ):
             labels = labels[:, 1:]
         batch["labels"] = labels
         return batch
@@ -277,6 +384,7 @@ def _promote_export(local_export: Path, persistent_export: Path, fingerprint: st
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    _safe_component(args.run_id, "--run-id")
     config = _load_yaml(args.config)
     if not args.train_manifest:
         raise SystemExit("At least one --train-manifest is required")
@@ -298,6 +406,7 @@ def main(argv: list[str] | None = None) -> int:
         "warmup_ratio": float(_setting(args, config, "warmup_ratio", 0.0)),
         "save_steps": int(_setting(args, config, "save_steps", 100)),
         "logging_steps": int(_setting(args, config, "logging_steps", 5)),
+        "checkpoint_keep": int(_setting(args, config, "checkpoint_keep", 2)),
         "seed": int(_setting(args, config, "seed", 17)),
         "lora_r": int(_setting(args, config, "lora_r", 16)),
         "lora_alpha": int(_setting(args, config, "lora_alpha", 32)),
@@ -311,6 +420,8 @@ def main(argv: list[str] | None = None) -> int:
     }
     if settings["hinglish_language_mode"] not in {"auto", "hi", "en"}:
         raise SystemExit("hinglish_language_mode must be auto, hi, or en")
+    if settings["checkpoint_keep"] < 1:
+        raise SystemExit("checkpoint_keep must be at least 1")
 
     try:
         import torch
@@ -330,8 +441,16 @@ def main(argv: list[str] | None = None) -> int:
         ) from exc
     if not torch.cuda.is_available():
         raise SystemExit("Whisper LoRA training requires an NVIDIA CUDA runtime")
+    if settings["load_in_8bit"]:
+        try:
+            import bitsandbytes  # noqa: F401
+        except ImportError as exc:
+            raise SystemExit(
+                "--load-in-8bit requires phase2/asr/requirements-8bit.txt"
+            ) from exc
 
     dtype, use_bf16, use_fp16 = _select_precision(torch, settings["precision"])
+    settings["precision_resolved"] = "bf16" if use_bf16 else "fp16"
     resolved_revision = _resolve_model_revision(
         settings["model"], settings["model_revision_requested"]
     )
@@ -362,10 +481,30 @@ def main(argv: list[str] | None = None) -> int:
         "argv": sys.argv if argv is None else argv,
         "cuda_device": torch.cuda.get_device_name(0),
     }
-    _atomic_json(experiment_dir / "run.json", run_metadata)
+    run_path = experiment_dir / "run.json"
+    if run_path.is_file():
+        existing_run = json.loads(run_path.read_text(encoding="utf-8"))
+        if not isinstance(existing_run, dict) or existing_run.get(
+            "run_fingerprint"
+        ) != fingerprint:
+            raise SystemExit(
+                f"Run ID has incompatible partial metadata: {args.run_id}"
+            )
+        run_metadata = existing_run
+    else:
+        if any(experiment_dir.iterdir()):
+            raise SystemExit(
+                f"Run ID has non-empty experiment storage without run.json: {args.run_id}"
+            )
+        _atomic_json(run_path, run_metadata)
 
     train_rows_by_manifest = [
-        _load_manifest(path, {"train"}) for path in args.train_manifest
+        _load_manifest(
+            path,
+            {"train"},
+            allow_incomplete=args.allow_incomplete_manifests,
+        )
+        for path in args.train_manifest
     ]
     train_rows, train_audio = _stage_rows(
         args.train_manifest, train_rows_by_manifest, work_dir / "staged-data" / "train"
@@ -374,11 +513,17 @@ def main(argv: list[str] | None = None) -> int:
     eval_audio: dict[str, Path] = {}
     if args.eval_manifest:
         eval_rows_by_manifest = [
-            _load_manifest(path, {"validation"}) for path in args.eval_manifest
+            _load_manifest(
+                path,
+                {"validation"},
+                allow_incomplete=args.allow_incomplete_manifests,
+            )
+            for path in args.eval_manifest
         ]
         eval_rows, eval_audio = _stage_rows(
             args.eval_manifest, eval_rows_by_manifest, work_dir / "staged-data" / "eval"
         )
+    _assert_train_eval_isolation(train_rows, eval_rows)
 
     processor = WhisperProcessor.from_pretrained(
         settings["model"], revision=resolved_revision
@@ -436,6 +581,7 @@ def main(argv: list[str] | None = None) -> int:
         logging_steps=settings["logging_steps"],
         save_strategy="steps",
         save_steps=settings["save_steps"],
+        save_total_limit=settings["checkpoint_keep"],
         eval_strategy="steps" if eval_dataset is not None else "no",
         eval_steps=settings["save_steps"] if eval_dataset is not None else None,
         gradient_checkpointing=settings["gradient_checkpointing"],
@@ -453,6 +599,11 @@ def main(argv: list[str] | None = None) -> int:
         def on_save(self, args, state, control, **kwargs):  # type: ignore[no-untyped-def]
             checkpoint = Path(args.output_dir) / f"checkpoint-{state.global_step}"
             sync_checkpoint(checkpoint, persistent_checkpoints, fingerprint)
+            prune_checkpoints(
+                persistent_checkpoints,
+                expected_fingerprint=fingerprint,
+                keep=settings["checkpoint_keep"],
+            )
             return control
 
     resume: str | bool | None = None
@@ -468,7 +619,9 @@ def main(argv: list[str] | None = None) -> int:
         except FileNotFoundError:
             resume = None
     elif args.resume_from_checkpoint.lower() != "none":
-        resume = args.resume_from_checkpoint
+        resume = str(
+            verify_checkpoint(args.resume_from_checkpoint, fingerprint).path
+        )
 
     trainer = Seq2SeqTrainer(
         model=model,
@@ -478,6 +631,7 @@ def main(argv: list[str] | None = None) -> int:
         data_collator=WhisperCollator(
             processor=processor,
             hinglish_language_mode=settings["hinglish_language_mode"],
+            decoder_start_token_id=model.config.decoder_start_token_id,
         ),
         processing_class=processor,
         callbacks=[DriveCheckpointCallback()],

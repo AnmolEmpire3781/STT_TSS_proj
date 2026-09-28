@@ -14,7 +14,7 @@ from typing import Any, Iterable
 from asr_pipeline.adapters.base import AdapterExample
 from asr_pipeline.adapters.registry import get_adapter
 from asr_pipeline.archives import TarShardWriter, stage_archived_audio
-from asr_pipeline.artifacts import mark_complete, sha256_file
+from asr_pipeline.artifacts import mark_complete, require_complete, sha256_file
 from asr_pipeline.audio import materialize_source_audio, validate_wav
 from asr_pipeline.manifests import read_manifest, write_manifest
 from asr_pipeline.revisions import ResolvedRevision, resolve_dataset_revision
@@ -54,7 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override a public source revision; repeat per source",
     )
     parser.add_argument("--seed", type=int, default=20260917)
-    parser.add_argument("--shard-size-mb", type=int, default=512)
+    parser.add_argument("--shard-size-mb", type=int, default=128)
     parser.add_argument("--drive-root", type=Path, default=DEFAULT_DRIVE_ROOT)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--work-dir", type=Path)
@@ -260,12 +260,23 @@ def _freeze_custom(
         if args.custom_manifest.is_dir()
         else args.custom_manifest
     ).resolve()
-    source_rows = [row for row in read_manifest(source_manifest) if row.split == "test"]
+    require_complete(source_manifest.parent, verify=True)
+    all_source_rows = read_manifest(source_manifest)
+    speaker_splits: dict[str, set[str]] = {}
+    for row in all_source_rows:
+        if row.extensions.get("human_verified") is not True:
+            raise RuntimeError(f"Custom row is not human verified: {row.id}")
+        speaker_splits.setdefault(row.speaker_id, set()).add(row.split)
+    leaking = sorted(
+        speaker for speaker, splits in speaker_splits.items() if len(splits) > 1
+    )
+    if leaking:
+        raise RuntimeError(
+            f"Custom source has speakers in multiple splits: {leaking[:5]}"
+        )
+    source_rows = [row for row in all_source_rows if row.split == "test"]
     if not source_rows:
         raise RuntimeError("Custom manifest contains no test rows")
-    for row in source_rows:
-        if row.extensions.get("human_verified") is not True:
-            raise RuntimeError(f"Custom test row is not human verified: {row.id}")
     source_rows.sort(key=lambda row: (_rank(args.seed, "custom-domain", row.id), row.id))
     if args.custom_limit:
         if args.custom_limit < 1:
