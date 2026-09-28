@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "normalization": "keyword-v1",
+  "keywords": [
+    {"canonical": "RAG", "aliases": ["retrieval augmented generation"]},
+    {"canonical": "LLM", "aliases": ["large language model"]},
+    {"canonical": "Qwen", "aliases": []},
+    {"canonical": "BGE-M3", "aliases": ["BGE M3"]},
+    {"canonical": "Chroma", "aliases": ["ChromaDB", "Chroma DB"]},
+    {"canonical": "FastAPI", "aliases": ["Fast API"]},
+    {"canonical": "Whisper", "aliases": []},
+    {"canonical": "LoRA", "aliases": ["low rank adaptation"]},
+    {"canonical": "QLoRA", "aliases": []},
+    {"canonical": "API", "aliases": []}
+  ]
+}

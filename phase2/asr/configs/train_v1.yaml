@@ -1,0 +1,25 @@
+schema_version: 1
+model: openai/whisper-large-v3-turbo
+model_revision: main
+#codec*change*+2026-09-17 The selected Hinglish mode is an experiment input,
+# never a hard-coded Hindi prefix. Replace this after the three-mode baseline.
+hinglish_language_mode: auto
+seed: 17
+max_steps: -1
+epochs: 2.0
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 16
+learning_rate: 0.0001
+warmup_ratio: 0.05
+save_steps: 100
+logging_steps: 5
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.05
+gradient_checkpointing: true
+max_audio_seconds: 30.0
+snapshot_plan_hours:
+  indicvoices_hi: 5.0
+  mucs_hinglish: 5.0
+  custom_min: 2.0
+  custom_max: 5.0

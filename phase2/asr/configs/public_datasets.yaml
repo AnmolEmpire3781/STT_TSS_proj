@@ -1,0 +1,90 @@
+schema_version: 1
+
+#codec*change*+2026-09-17: Mutable refs are resolved once and locked as full
+# commit SHAs before any row is streamed or a resumable artifact is created.
+revision_policy: resolve_to_full_commit_sha
+streaming_required: true
+
+snapshot_defaults:
+  seed: 20260917
+  shuffle_buffer_size: 1000
+  audio:
+    format: wav
+    sample_rate: 16000
+    channels: 1
+    codec: pcm_s16le
+
+sources:
+  indicvoices_hi:
+    adapter: indicvoices_hi
+    dataset_id: ai4bharat/IndicVoices
+    config_name: hindi
+    requested_revision: main
+    gated: true
+    language: hi
+    splits:
+      train:
+        canonical_split: train
+        uses: [training]
+        target_hours: 5.0
+      valid:
+        canonical_split: validation
+        uses: [evaluation]
+
+  mucs_hinglish:
+    adapter: mucs_hinglish
+    dataset_id: dianavdavidson/MUCS-Hinglish
+    config_name: null
+    requested_revision: main
+    gated: false
+    language: hi-en
+    splits:
+      train:
+        canonical_split: train
+        uses: [training]
+        target_hours: 5.0
+      test:
+        canonical_split: test
+        uses: [evaluation]
+    provenance_note: >-
+      Retain upstream OpenSLR identity and the stricter upstream license in
+      frozen snapshot metadata until the mirror/upstream license discrepancy
+      is reviewed.
+
+  svarah:
+    adapter: svarah
+    dataset_id: ai4bharat/Svarah
+    config_name: null
+    requested_revision: main
+    gated: false
+    language: en
+    splits:
+      test:
+        canonical_split: test
+        uses: [evaluation]
+
+evaluation_suites:
+  benchmark500:
+    immutable: true
+    seed: 20260917
+    quotas:
+      indicvoices_hi: 200
+      mucs_hinglish: 200
+      svarah: 100
+    nested_views:
+      smoke25:
+        indicvoices_hi: 10
+        mucs_hinglish: 10
+        svarah: 5
+      smoke100:
+        indicvoices_hi: 40
+        mucs_hinglish: 40
+        svarah: 20
+      benchmark500:
+        indicvoices_hi: 200
+        mucs_hinglish: 200
+        svarah: 100
+
+  custom_domain:
+    immutable_after_freeze: true
+    available_after_verified_custom_test_data: true
