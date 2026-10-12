@@ -24,6 +24,7 @@ from asr_pipeline.schema import CanonicalRecord
 DEFAULT_DRIVE_ROOT = Path("/content/drive/MyDrive/voice-rag-phase2/stt")
 DEFAULT_WORK_ROOT = Path("/content/voice-rag-asr")
 DEFAULT_KEYWORDS = Path(__file__).resolve().parent / "configs" / "domain_keywords.json"
+MAX_PUBLIC_SCAN_ROWS = 10_000_000
 PUBLIC_SOURCES = {
     "indicvoices_hi": {"split": "valid", "quota": 200},
     "mucs_hinglish": {"split": "test", "quota": 200},
@@ -88,16 +89,28 @@ def _rank(seed: int, source: str, sample_id: str) -> int:
 
 
 def _bounded_hash_sample(
-    rows: Iterable[AdapterExample], *, source: str, quota: int, seed: int
+    rows: Iterable[AdapterExample], *, source: str, quota: int, seed: int,
+    stats: dict[str, int] | None = None, max_rows: int = MAX_PUBLIC_SCAN_ROWS,
 ) -> list[AdapterExample]:
     """Keep only the lowest deterministic hash ranks while streaming a split."""
 
     selected: list[tuple[int, str, AdapterExample]] = []
     seen: set[str] = set()
-    for row in rows:
+    if quota <= 0 or max_rows <= 0:
+        raise ValueError("quota and max_rows must be positive")
+    counts = stats if stats is not None else {}
+    counts.update(rows_scanned=0, unique_rows=0, duplicate_rows=0)
+    for index, row in enumerate(rows):
+        if index >= max_rows:
+            raise RuntimeError(f"{source} exceeded scan limit of {max_rows} rows")
+        counts["rows_scanned"] += 1
         if row.id in seen:
-            raise RuntimeError(f"Duplicate source id in {source}: {row.id}")
+            #codec*change*+2026-10-12: AdapterExample is validated; first occurrence
+            # wins even if it is later evicted from the lowest-hash sample.
+            counts["duplicate_rows"] += 1
+            continue
         seen.add(row.id)
+        counts["unique_rows"] += 1
         candidate = (_rank(seed, source, row.id), row.id, row)
         if len(selected) < quota:
             selected.append(candidate)
@@ -106,7 +119,7 @@ def _bounded_hash_sample(
         if candidate[:2] < selected[worst_index][:2]:
             selected[worst_index] = candidate
     if len(selected) < quota:
-        raise RuntimeError(f"{source} contains only {len(selected)} rows; need {quota}")
+        raise RuntimeError(f"{source} contains only {len(selected)} unique rows; need {quota}")
     selected.sort(key=lambda item: item[:2])
     return [item[2] for item in selected]
 
@@ -146,7 +159,8 @@ def _atomic_json(path: Path, value: object) -> None:
 
 
 def _public_selection(
-    revisions: dict[str, str], token: str | None, seed: int
+    revisions: dict[str, str], token: str | None, seed: int,
+    source_stats: dict[str, dict[str, int]] | None = None,
 ) -> tuple[dict[str, list[AdapterExample]], dict[str, ResolvedRevision]]:
     pools: dict[str, list[AdapterExample]] = {}
     locks: dict[str, ResolvedRevision] = {}
@@ -158,9 +172,13 @@ def _public_selection(
         stream = adapter.iter_source(
             str(source_config["split"]), lock.resolved_sha, token=token, streaming=True
         )
+        stats: dict[str, int] = {}
         pools[source] = _bounded_hash_sample(
-            stream, source=source, quota=int(source_config["quota"]), seed=seed
+            stream, source=source, quota=int(source_config["quota"]), seed=seed,
+            stats=stats,
         )
+        if source_stats is not None:
+            source_stats[source] = stats
         locks[source] = lock
     return pools, locks
 
@@ -185,9 +203,14 @@ def _freeze_public(
     keyword_catalog: list[dict[str, Any]],
 ) -> tuple[list[CanonicalRecord], dict[str, Any]]:
     token = os.getenv(args.hf_token_env) or None
-    pools, locks = _public_selection(_revision_overrides(args.revision), token, args.seed)
+    source_stats: dict[str, dict[str, int]] = {}
+    pools, locks = _public_selection(
+        _revision_overrides(args.revision), token, args.seed, source_stats
+    )
     profiles = _profile_ids(pools, args.seed)
     by_id = {example.id: example for values in pools.values() for example in values}
+    if len(by_id) != sum(len(values) for values in pools.values()):
+        raise RuntimeError("Duplicate canonical IDs across public sources")
     ordered = [by_id[sample_id] for sample_id in profiles["benchmark500"]]
     _atomic_json(
         incomplete / "source-locks.json",
@@ -200,6 +223,10 @@ def _freeze_public(
         "suite_type": "public_benchmark",
         "profiles": profiles,
         "selection_algorithm": "streaming-lowest-sha256-rank-v1",
+        "duplicate_policy": "first-valid-occurrence",
+        "source_selection_stats": source_stats,
+        "duplicate_rows": sum(stats["duplicate_rows"] for stats in source_stats.values()),
+        "max_source_scan_rows": MAX_PUBLIC_SCAN_ROWS,
         "source_revisions": {
             source: lock.resolved_sha for source, lock in locks.items()
         },
